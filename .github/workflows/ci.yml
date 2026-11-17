@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  # Sur les PR : toujours, sans filtre de chemins (sinon une PR "doc" resterait bloquée).
+  pull_request:
+  # Sur main : pas besoin de tout relancer pour un commit de documentation.
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+# Moindre privilège : le jeton du workflow peut seulement lire le dépôt.
+permissions:
+  contents: read
+
+# Un nouveau push sur une PR annule le run devenu inutile. Jamais sur main.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Seuil bloquant de couverture des lignes de l'API (tests unitaires).
+  COVERAGE_MIN: 75
+
+jobs:
+  api:
+    name: api
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v7
+
+      - name: Installation de Node ${{ matrix.node }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+
+      - name: Installation des dépendances
+        run: npm ci
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Formatage (Prettier)
+        run: npm run format:check
+
+      - name: Tests unitaires + couverture
+        run: npm run test:coverage
+
+      - name: Couverture (seuil ${{ env.COVERAGE_MIN }} %)
+        run: |
+          summary=coverage/coverage-summary.json
+          lines=$(jq -r '.total.lines.pct' "$summary")
+          {
+            echo "### Couverture de l'API (Node ${{ matrix.node }})"
+            echo ""
+            echo "| Métrique | Couverture |"
+            echo "|---|---|"
+            for metric in lines statements functions branches; do
+              echo "| ${metric} | $(jq -r ".total.${metric}.pct" "$summary") % |"
+            done
+            echo ""
+            echo "Seuil bloquant sur les lignes : **${COVERAGE_MIN} %**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if awk -v p="$lines" -v min="$COVERAGE_MIN" 'BEGIN { exit !(p < min) }'; then
+            echo "::error title=Couverture insuffisante::lignes ${lines} % < seuil ${COVERAGE_MIN} %"
+            exit 1
+          fi
+          echo "Couverture des lignes : ${lines} % (seuil ${COVERAGE_MIN} %)"
+
+  api-integration:
+    name: api-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: taskflow # base jetable, détruite avec le job : pas un secret
+          POSTGRES_DB: taskflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U taskflow -d taskflow"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: api
+    env:
+      DATABASE_URL: postgres://taskflow:taskflow@localhost:5432/taskflow
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v7
+      - name: Installation de Node 20
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - name: Installation des dépendances
+        run: npm ci
+      - name: Tests d'intégration (PostgreSQL 16)
+        run: npm run test:int
+
+  front:
+    name: front
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: front
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v7
+      - name: Installation de Node 20
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: front/package-lock.json
+      - name: Installation des dépendances
+        run: npm ci
+      - name: Lint (ESLint)
+        run: npm run lint
+      - name: Formatage (Prettier)
+        run: npm run format:check
+      - name: Tests (Vitest) + couverture (information)
+        run: |
+          npm run test:coverage
+          {
+            echo "### Couverture du front (information, non bloquante)"
+            echo ""
+            echo "Lignes : $(jq -r '.total.lines.pct' coverage/coverage-summary.json) %"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build (Vite)
+        run: npm run build
+      - name: Artefact front-dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: front-dist
+          path: front/dist/ # chemin depuis la racine : upload-artifact ignore working-directory
+          retention-days: 7
+          if-no-files-found: error
