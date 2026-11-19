@@ -3,6 +3,7 @@
 // repository en mémoire : pas de port réseau, pas de base de données.
 import express from 'express';
 import { createRequestLogger, writeLog } from './logger.js';
+import { createMetrics } from './metrics.js';
 
 const MAX_TITLE_LENGTH = 200;
 
@@ -23,7 +24,7 @@ function parseTitle(body) {
   return isValid ? title : null;
 }
 
-function createTaskRoutes(repository) {
+function createTaskRoutes(repository, metrics) {
   const router = express.Router();
 
   router.get(
@@ -42,7 +43,9 @@ function createTaskRoutes(repository) {
           error: `Le titre est obligatoire (1 à ${MAX_TITLE_LENGTH} caractères)`,
         });
       }
-      return res.status(201).json(await repository.create(title));
+      const task = await repository.create(title);
+      metrics.taskCreated();
+      return res.status(201).json(task);
     }),
   );
 
@@ -97,14 +100,28 @@ export function createApp({
   appEnv = 'local',
   appVersion = 'dev',
   log = writeLog,
+  metrics = createMetrics({ appVersion }),
 }) {
   const app = express();
 
+  // Durcissement (Jour 5, OWASP A05 « mauvaise configuration ») : ne pas annoncer
+  // la technologie utilisée (en-tête X-Powered-By: Express), signalé par ZAP.
+  app.disable('x-powered-by');
+
+  // /metrics est déclarée AVANT le logger et le middleware de mesure : les
+  // collectes de Prometheus (toutes les 15 s) ne polluent ni les logs ni les
+  // compteurs RED. Elle n'est joignable que sur le réseau Docker : les Nginx
+  // (front, proxy) ne la routent pas vers l'extérieur.
+  app.get('/metrics', asyncHandler(metrics.handler));
+
   app.use(createRequestLogger(log));
-  app.use(express.json());
+  app.use(metrics.middleware);
+  // Limite de taille du corps : un titre fait 200 caractères max, 16 ko suffisent
+  // largement. Au-delà, 413 : on n'alloue pas de mémoire pour un corps géant.
+  app.use(express.json({ limit: '16kb' }));
 
   app.get('/health', createHealthHandler({ repository, appEnv, appVersion }));
-  app.use('/api/tasks', createTaskRoutes(repository));
+  app.use('/api/tasks', createTaskRoutes(repository, metrics));
 
   app.use((_req, res) => {
     res.status(404).json({ error: 'Route inconnue' });
@@ -115,6 +132,9 @@ export function createApp({
   app.use((err, _req, res, _next) => {
     if (err.type === 'entity.parse.failed') {
       return res.status(400).json({ error: 'JSON invalide' });
+    }
+    if (err.type === 'entity.too.large') {
+      return res.status(413).json({ error: 'Requête trop volumineuse' });
     }
     log({ level: 'error', message: err.message });
     return res.status(500).json({ error: 'Erreur interne du serveur' });
