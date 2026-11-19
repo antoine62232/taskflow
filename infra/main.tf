@@ -154,7 +154,7 @@ resource "docker_container" "front" {
     test         = ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
     interval     = "10s"
     timeout      = "3s"
-    retries      = 3
+    retries      = 4
     start_period = "5s"
   }
 
